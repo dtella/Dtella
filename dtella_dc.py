@@ -33,6 +33,13 @@ import struct
 import re
 import binascii
 
+# Login Procedure
+# H>C $HubName
+# H<C $ValidateNick
+# H>C $Hello
+# H<C $GetNickList + $MyINFO
+# ...
+
 
 class DCHandler(LineOnlyReceiver):
 
@@ -51,25 +58,24 @@ class DCHandler(LineOnlyReceiver):
         self.info = ''
         self.nick = ''
         self.bot = DtellaBot(self, '*Dtella')
+
+        # Handlers which can be used before attaching to Dtella
         self.addDispatch('$ValidateNick',   1, self.d_ValidateNick)
-        self.addDispatch('$GetINFO',        2, self.d_GetInfo)
-        self.addDispatch('$ConnectToMe',    2, self.d_ConnectToMe)
-        self.addDispatch('$RevConnectToMe', 2, self.d_RevConnectToMe)
         self.addDispatch('$GetNickList',    0, self.d_GetNickList)
         self.addDispatch('$MyINFO',        -3, self.d_MyInfo)
-        self.addDispatch('$Search',        -2, self.d_Search)
-        self.addDispatch('$To:',           -5, self.d_PrivateMsg)
+        self.addDispatch('$GetINFO',        2, self.d_GetInfo)
         self.addDispatch('',                0, self.d_KeepAlive)
-        self.nicks = {}
-
+        self.addDispatch('$KillDtella',     0, self.d_KillDtella)
+        
         # Chat messages waiting to be sent
         self.chatq = []
         self.chat_counter = 99999
         self.chatRate_dcall = None
 
-        # ['login', 'ready', 'invisible']
-        self.state = 'login'
+        # ['login_N', 'login_G', 'login_I', 'queued', 'ready', 'invisible']
+        self.state = 'login_N'
 
+        self.queued_dcall = None
         self.autoRejoin_dcall = None
 
         self.sendLine("$Lock FOO Pk=BAR")
@@ -77,14 +83,16 @@ class DCHandler(LineOnlyReceiver):
 
         self.scheduleChatRateControl()
 
-        self.sendLine("$NickList %s$$" % self.bot.nick)
-        self.sendLine("$OpList %s$$" % self.bot.nick)
 
-        self.main.addDCHandler(self)
-        
+    def isOnline(self):
+        osm = self.main.osm
+        return (self.state == 'ready' and osm and osm.syncd)
+
 
     def connectionLost(self, reason):
-        self.main.removeDCHandler()
+
+        self.main.removeDCHandler(self)
+
         dcall_discard(self, 'chatRate_dcall')
         dcall_discard(self, 'autoRejoin_dcall')
 
@@ -125,12 +133,23 @@ class DCHandler(LineOnlyReceiver):
         self.dispatch[command] = (nargs, fn)
 
 
+    def fatalError(self, text):
+        self.pushStatus("ERROR: %s" % text)
+        self.transport.loseConnection()
+
+
+    def d_KillDtella(self):
+        reactor.stop()
+
+
     def d_ValidateNick(self, nick):
 
-        if self.state != 'login' or self.nick:
-            self.pushStatus("ERROR: $ValidateNick may only be sent once during login.")
-            self.transport.loseConnection()
+        if self.state != 'login_N':
+            self.fatalError("$ValidateNick not expected.")
             return
+
+        # Next, we expect $GetNickList
+        self.state = 'login_G'
 
         reason = validateNick(nick)
 
@@ -140,10 +159,8 @@ class DCHandler(LineOnlyReceiver):
             self.transport.loseConnection()
             return
 
-        self.addDispatch("<%s>" % nick, -1, self.d_PublicMsg)
         self.nick = nick
-        
-        self.pushHello(self.bot.nick)
+
         self.pushHello(self.nick)
 
 
@@ -154,7 +171,7 @@ class DCHandler(LineOnlyReceiver):
             self.pushInfo(nick, dcinfo)
             return
 
-        if not self.main.getOnlineDCH():
+        if not self.isOnline():
             return
 
         try:
@@ -168,16 +185,19 @@ class DCHandler(LineOnlyReceiver):
 
     def d_GetNickList(self):
 
-        if not self.nick:
-            self.pushStatus("ERROR: Must send $ValidateNick before $GetNickList.")
-            self.transport.loseConnection()
+        if self.state == 'login_N':
+            self.fatalError("Got $GetNickList, expected $ValidateNick")
             return
+
+        # Next, we expect $MyINFO
+        if self.state == 'login_G':
+            self.state = 'login_I'
 
         # Me and the bot are ALWAYS online
         nicks = [self.bot.nick, self.nick]
 
         # Add in the Dtella nicks, if we're fully online (DC and Dtella)
-        if self.main.getOnlineDCH():
+        if self.isOnline():
             nicks = set(nicks)
             nicks.update(self.main.osm.nkm.getNickList())
             nicks = list(nicks)
@@ -190,32 +210,82 @@ class DCHandler(LineOnlyReceiver):
 
     def d_MyInfo(self, _1, _2, info):
 
-        info = info.replace('\r','').replace('\n','')
+        if self.state == 'login_N':
+            self.fatalError("Got $MyINFO, expected $ValidateNick")
+            return
 
-        if not self.nick:
-            self.pushStatus("ERROR: Must send $ValidateNick before $MyInfo.")
-            self.transport.loseConnection()
+        elif self.state == 'login_G':
+            self.fatalError("Got $MyINFO, expected $GetNickList")
             return
 
         # Save my new info
-        self.info = info
+        self.info = info.replace('\r','').replace('\n','')
 
-        logging_in = (self.state == 'login')
+        if self.state == 'login_I':
+            self.loginComplete()
 
-        # The DC login phase is "officially over" because we have both a nick
-        # and and Info string to go with it.
-        if logging_in:
-            self.state = 'ready'
-
-        # If we're on, send my info
-        if self.main.getOnlineDCH():
+        elif self.isOnline():
             self.main.osm.updateMyInfo()
 
-            # If we were logging in, but now we're all set to go,
-            # then send the full Dtella nick list.
-            if logging_in:
-                self.d_GetNickList()
-                self.grabDtellaTopic()
+
+    def loginComplete(self):
+
+        assert self.state == 'login_I'
+
+        if self.main.dch is None:
+            self.attachMeToDtella()
+
+        elif self.main.pending_dch is None:
+            self.state = 'queued'
+            self.main.pending_dch = self
+
+            def cb():
+                self.queued_dcall = None
+                self.main.pending_dch = None
+                self.pushStatus("Nope, it didn't leave.  Goodbye.")
+                self.transport.loseConnection()
+
+            self.pushStatus(
+                "Another DC client is already using Dtella on this computer.")
+            self.pushStatus(
+                "Waiting 5 seconds for it to leave.")
+
+            self.queued_dcall = reactor.callLater(5.0, cb)
+
+        else:
+            self.pushStatus(
+                "Dtella is busy with other DC connections from your "
+                "computer.  Goodbye.")
+            self.transport.loseConnection()
+
+
+    def attachMeToDtella(self):
+
+        assert (self.main.dch is None)
+
+        if self.state == 'queued':
+            self.queued_dcall.cancel()
+            self.queued_dcall = None
+            self.pushStatus(
+                "The other client left.  Resuming normal connection.")
+
+        dcall_discard(self, 'queued_dcall')
+
+        # Add the post-login handlers
+        self.addDispatch('$ConnectToMe',      2, self.d_ConnectToMe)
+        self.addDispatch('$RevConnectToMe',   2, self.d_RevConnectToMe)
+        self.addDispatch('$Search',          -2, self.d_Search)
+        self.addDispatch('$To:',             -5, self.d_PrivateMsg)
+        self.addDispatch("<%s>" % self.nick, -1, self.d_PublicMsg)
+
+        self.state = 'ready'
+        self.main.addDCHandler(self)
+
+        # If Dtella's online too, then sync both ways
+        if self.isOnline():
+            self.main.osm.updateMyInfo()
+            self.d_GetNickList()
+            self.grabDtellaTopic()
 
 
     def formatMyInfo(self):
@@ -269,7 +339,7 @@ class DCHandler(LineOnlyReceiver):
     def d_Search(self, addr_string, search_string):
         # Send a search request
 
-        if not self.main.getOnlineDCH():
+        if not self.isOnline():
             self.pushStatus("Can't Search: Not online!")
             return
 
@@ -286,8 +356,10 @@ class DCHandler(LineOnlyReceiver):
         packet.append(search_string)
         
         osm.mrm.newMessage(''.join(packet), tries=4)
-        
-        self.pushSearchRequest(osm.me.ipp, search_string)
+
+        # If local searching is enabled, send the search to myself
+        if self.main.state.localsearch:
+            self.pushSearchRequest(osm.me.ipp, search_string)
 
 
     def d_PrivateMsg(self, nick, _1, _2, _3, text):
@@ -318,7 +390,7 @@ class DCHandler(LineOnlyReceiver):
                 "*** Your message \"%s\" could not be sent: %s"
                 % (shorttext, detail))
 
-        if not self.main.getOnlineDCH():
+        if not self.isOnline():
             fail_cb("You're not online.")
             return
 
@@ -337,25 +409,25 @@ class DCHandler(LineOnlyReceiver):
 
         def fail_cb(detail):
             self.pushStatus(
-                "*** Connect request to '%s' failed: %s" % (nick, detail))
+                "*** Connection to '%s' failed: %s" % (nick, detail))
 
-        if not self.main.getOnlineDCH():
-            fail_cb("You're not online.")
+        if not self.isOnline():
+            fail_cb("you're not online.")
             return
 
         try:
             dc_ad = Ad().setTextIPPort(addr)
         except ValueError:
-            fail_cb("Malformed address.")
+            fail_cb("malformed address.")
             return
 
         try:
             n = osm.nkm.lookupNick(nick)
         except KeyError:
             if nick == self.bot.nick:
-                fail_cb("Connecting to yourself!")
+                fail_cb("can't connect to yourself!")
             else:
-                fail_cb("User doesn't seem to exist.")
+                fail_cb("user doesn't seem to exist.")
             return
 
         if n.checkRevConnectWindow():
@@ -363,7 +435,7 @@ class DCHandler(LineOnlyReceiver):
             def fail_cb(detail):
                 pass
 
-        elif self.belowMinShare():
+        elif self.isLeech():
             # I'm a leech
             return
 
@@ -376,29 +448,29 @@ class DCHandler(LineOnlyReceiver):
 
         def fail_cb(detail):
             self.pushStatus(
-                "*** Connect request to '%s' failed: %s" % (nick, detail))
+                "*** Connection to '%s' failed: %s" % (nick, detail))
 
-        if not self.main.getOnlineDCH():
-            fail_cb("You're not online.")
+        if not self.isOnline():
+            fail_cb("you're not online.")
             return
 
         try:
             n = osm.nkm.lookupNick(nick)
         except KeyError:
             if nick == self.bot.nick:
-                fail_cb("Connecting to yourself!")
+                fail_cb("can't connect to yourself!")
             else:
-                fail_cb("User doesn't seem to exist.")
+                fail_cb("user doesn't seem to exist.")
             return
 
-        if self.belowMinShare():
+        if self.isLeech():
             # I'm a leech
             return
 
         n.event_RevConnectToMe(self.main, fail_cb)
 
 
-    def belowMinShare(self):
+    def isLeech(self):
         # If I don't meet the minimum share, yell and return True
 
         osm = self.main.osm
@@ -435,7 +507,7 @@ class DCHandler(LineOnlyReceiver):
             if self.bot.commandInput(out, text[1:], '!'):
                 return
 
-        if not self.main.getOnlineDCH():
+        if not self.isOnline():
             self.pushStatus("*** You must be online to chat!")
             return
 
@@ -543,7 +615,7 @@ class DCHandler(LineOnlyReceiver):
 
     def broadcastChatMessage(self, flags, text):
 
-        assert self.main.getOnlineDCH()
+        assert self.isOnline()
 
         osm = self.main.osm
 
@@ -607,7 +679,7 @@ class DCHandler(LineOnlyReceiver):
         nick = m.group(1)
         data = m.group(2)
 
-        # TODO: maybe make this replacement optional?
+        # If I get results from myself, map them to the bot's nick
         if nick == self.nick:
             nick = self.bot.nick
 
@@ -616,7 +688,7 @@ class DCHandler(LineOnlyReceiver):
 
 
     def grabDtellaTopic(self):
-        if self.main.getOnlineDCH():
+        if self.isOnline():
             tm = self.main.osm.tm
             self.pushTopic(tm.topic)
             if tm.topic:
@@ -725,65 +797,6 @@ class DCHandler(LineOnlyReceiver):
 ##############################################################################
 
 
-class DCPurgatory(Protocol):
-    # When a DC connection already exists, pass the next connection here
-
-
-    def __init__(self, main):
-        self.main = main
-
-
-    def showStatus(self, text):
-        self.transport.write("<*Dtella> %s|" % text)
-
-
-    def connectionMade(self):
-        # If another client is already waiting, reject immediately
-        if self.main.pending_dch:
-            self.showStatus("Dtella is busy with other DC connections"
-                            " from your computer.  Goodbye.")
-            return
-
-        # Otherwise, set us as the pending_dch for a while
-        self.transport.stopReading()
-        self.main.pending_dch = self
-
-        def cb():
-            self.main.pending_dch = None
-            self.showStatus("Nope, it didn't leave.  Goodbye.")
-            self.transport.loseConnection()
-
-        self.timeout_dcall = reactor.callLater(5.0, cb)
-
-        self.showStatus(
-            "Another DC client is already using Dtella on this computer.")
-        self.showStatus(
-            "Waiting 5 seconds for it to leave.")
-
-
-    def connectionLost(self, reason):
-        if self.main.pending_dch is self:
-            self.main.pending_dch = None
-
-
-    def accept(self):
-        self.timeout_dcall.cancel()
-        self.main.pending_dch = None
-
-        self.showStatus("The other client left.  Resuming normal connection.")
-
-        # Transplant this connection into a new DCHandler and fire it up
-        p = DCHandler(self.main)
-        p.factory = self.factory
-        p.transport = self.transport
-        p.transport.protocol = p
-        p.transport.startReading()
-        p.connectionMade()
-
-
-##############################################################################
-
-
 class DCFactory(ServerFactory):
     
     def __init__(self, main, listen_port):
@@ -794,10 +807,7 @@ class DCFactory(ServerFactory):
         if addr.host != '127.0.0.1':
             return None
 
-        if not self.main.dch:
-            p = DCHandler(self.main)
-        else:
-            p = DCPurgatory(self.main)
+        p = DCHandler(self.main)
 
         p.factory = self
         return p
@@ -884,15 +894,19 @@ class DtellaBot(object):
 
     
     minihelp = [
-        ("--",         "CONTROLS"),
+        ("--",         "ACTIONS"),
         ("REJOIN",     "Hop back online after a kick or collision"),
-        ("TOPIC",      "View or change the global topic"),
-        ("SUFFIX",     "View or change the your location suffix"),
-        ("UDP",        "Change Dtella's peer communication port"),
         ("ADDPEER",    "Add the address of another node to your cache"),
         ("REBOOT",     "Exit from the network and immediately reconnect"),
+        ("TERMINATE",  "Completely kill your current Dtella process."),
+        ("--",         "SETTINGS"),
+        ("TOPIC",      "View or change the global topic"),
+        ("SUFFIX",     "View or change your location suffix"),
+        ("UDP",        "Change Dtella's peer communication port"),
+        ("LOCALSEARCH","View or toggle local search results."),
         ("PERSISTENT", "View or toggle persistent mode"),
-        ("--",         "STATISTICS"),
+        ("--",         "INFORMATION"),
+        ("VERSION",    "View information about your Dtella version."),
         ("USERS",      "Show how many users exist at each location"),
         ("SHARED",     "Show how many bytes are shared at each location"),
         ("DENSE",      "Show the bytes/user density for each location"),
@@ -929,6 +943,28 @@ class DtellaBot(object):
             "If you provide no arguments, this will display the "
             "current suffix.  To clear the suffix, just follow the command "
             "with a single space."
+            ),
+
+        "TERMINATE":(
+            "",
+            "This will completely kill your current Dtella node.  If you "
+            "want to rejoin the network afterward, you'll have to go "
+            "start up the Dtella program again."
+            ),
+
+        "VERSION":(
+            "",
+            "This will display your current Dtella version number.  If "
+            "available, it will also display the minimum required version, "
+            "the newest available version, and a download link."
+            ),
+
+        "LOCALSEARCH":(
+            "<ON | OFF>",
+            "If local searching is enabled, then when you search, you will "
+            "see search results from the *Dtella user, which are actually "
+            "hosted on your computer.  Use this command without any arguments "
+            "to see whether local searching is currently enabled or not."
             ),
 
         "USERS":(
@@ -1131,6 +1167,30 @@ class DtellaBot(object):
         self.syntaxHelp(out, 'PERSISTENT', prefix)
 
 
+    def handleCmd_LOCALSEARCH(self, out, args, prefix):
+        if len(args) == 0:
+            if self.main.state.localsearch:
+                out("Local searching is currently ON.")
+            else:
+                out("Local searching is currently OFF.")
+            return
+
+        if len(args) == 1:
+            if args[0] == 'ON':
+                out("Set local searching to ON.")
+                self.main.state.localsearch = True
+                self.main.state.saveState()
+                return
+
+            elif args[0] == 'OFF':
+                out("Set local searching to OFF.")
+                self.main.state.localsearch = False
+                self.main.state.saveState()
+                return
+
+        self.syntaxHelp(out, 'LOCALSEARCH', prefix)
+        
+
     def handleCmd_REJOIN(self, out, args, prefix):
 
         if len(args) == 0:
@@ -1148,7 +1208,7 @@ class DtellaBot(object):
 
     def handleCmd_USERS(self, out, args, preifx):
 
-        if not self.main.getOnlineDCH():
+        if not self.dch.isOnline():
             out("You must be online to use %sUSERS." % prefix)
             return
         
@@ -1163,7 +1223,7 @@ class DtellaBot(object):
 
     def handleCmd_SHARED(self, out, args, preifx):
 
-        if not self.main.getOnlineDCH():
+        if not self.dch.isOnline():
             out("You must be online to use %sSHARED." % prefix)
             return
         
@@ -1178,7 +1238,7 @@ class DtellaBot(object):
 
     def handleCmd_DENSE(self, out, args, prefix):
 
-        if not self.main.getOnlineDCH():
+        if not self.dch.isOnline():
             out("You must be online to use %sDENSE." % prefix)
             return
 
@@ -1199,7 +1259,7 @@ class DtellaBot(object):
 
     def handleCmd_RANK(self, out, args, prefix):
 
-        if not self.main.getOnlineDCH():
+        if not self.dch.isOnline():
             out("You must be online to use %sRANK." % prefix)
             return
 
@@ -1254,7 +1314,7 @@ class DtellaBot(object):
         
     def handleCmd_TOPIC(self, out, topic, prefix):
         
-        if not self.main.getOnlineDCH():
+        if not self.dch.isOnline():
             out("You must be online to use %sTOPIC." % prefix)
             return
 
@@ -1287,7 +1347,7 @@ class DtellaBot(object):
 
     def showStats(self, out, title, compute, format, peers_only):
 
-        assert self.main.getOnlineDCH()
+        assert self.dch.isOnline()
 
         # Count users and bytes
         ucount = {}
@@ -1323,6 +1383,29 @@ class DtellaBot(object):
             out("| %s <= %s" % (format(values[loc]), loc))
         out("|")
         out("\\_ Overall: %s _/" % format(overall))
+
+
+    def handleCmd_VERSION(self, out, args, prefix):
+        if len(args) == 0:
+            out("You have Dtella version %s." % dtella_local.version)
+
+            if self.main.dnsh.version:
+                min_v, new_v, url = self.main.dnsh.version
+                out("The minimum required version is %s." % min_v)
+                out("The latest posted version is %s." % new_v)
+                out("Download Link: %s" % url)
+
+            return
+
+        self.syntaxHelp(out, 'VERSION', prefix)
+
+
+    def handleCmd_TERMINATE(self, out, args, prefix):
+        if len(args) == 0:
+            reactor.stop()
+            return
+
+        self.syntaxHelp(out, 'TERMINATE', prefix)
 
 
     def handleCmd_VERSION_OVERRIDE(self, out, text, prefix):
@@ -1410,7 +1493,7 @@ class DtellaBot(object):
 
         now = seconds()
 
-        out("Online Nodes: {ipp, nb, persist, expire, uptime, nick}")
+        out("Online Nodes: {ipp, nb, persist, expire, uptime, dttag, nick}")
 
         lines = []
 
@@ -1432,12 +1515,14 @@ class DtellaBot(object):
                 info.append("%4d" % dcall_timeleft(osm.sendStatus_dcall))
             else:
                 info.append("%4d" % dcall_timeleft(n.expire_dcall))
+
             info.append("%8d" % (now - n.uptime))
+            info.append("%8s" % n.dttag[3:])
             info.append("(%s)" % n.nick)
 
             lines.append(info)
 
-        if 1 <= sortkey <= 6:
+        if 1 <= sortkey <= 7:
             lines.sort(key=lambda l: l[sortkey-1])
 
         for line in lines:

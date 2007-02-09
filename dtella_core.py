@@ -41,16 +41,7 @@ from dtella_util import (RandSet, Ad, dcall_discard, dcall_timeleft, randbytes,
                          get_version_string, parse_dtella_tag)
 
 
-# TODO: expandpath can leave ~ intact sometimes.  Write a workaround.
-
-# TODO: make an option to disable local search replies
-
-# TODO: notify when somebody else gets banned
-
-# TODO: rewrite DCHandler stuff so that a DC client isn't really "online"
-#       until after the MyINFO + GetNickList
-
-# TODO: persistent mode ignores DNS query when removing the udp_port blocker
+# TODO: find out what's wrong with Blueldr137??
 
 
 # Miscellaneous Exceptions
@@ -283,6 +274,7 @@ class PeerHandler(DatagramProtocol):
                 dch.pushSearchResult(rawdata)
             return
 
+        # TODO: this is deprecated
         elif rawdata == "DTELLA_KILL" and ad.ip == (127,0,0,1):
             reactor.stop()
             return
@@ -1951,10 +1943,10 @@ class MeNode(Node):
             fail_cb("I'm not online!")
 
     def event_ConnectToMe(self, main, port, fail_cb):
-        fail_cb("Connecting to yourself!")
+        fail_cb("can't connect to yourself!")
 
     def event_RevConnectToMe(self, main, fail_cb):
-        fail_cb("Connecting to yourself!")
+        fail_cb("can't connect to yourself!")
 
 
 
@@ -3960,8 +3952,6 @@ class DtellaMain_Base(object):
        
         self.myip_reports = []
 
-        self.blockers = set()
-
         self.reconnect_dcall = None
 
         self.reconnect_interval = RECONNECT_RANGE[0]
@@ -4098,8 +4088,11 @@ class DtellaMain_Base(object):
     def shutdown(self, reconnect):
         # Do a total shutdown of this Dtella node
 
-        if self.icm or self.osm:
-            self.showLoginStatus("Shutting down.")
+        if not (self.icm or self.osm):
+            # Nothing to do.
+            return
+
+        self.showLoginStatus("Shutting down.")
 
         dcall_discard(self, 'reconnect_dcall')
 

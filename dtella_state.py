@@ -27,6 +27,7 @@ import heapq
 from twisted.internet import reactor
 import os
 import os.path
+import twisted.python.log
 
 from dtella_util import Ad, dcall_discard
 
@@ -34,34 +35,26 @@ class StateManager(object):
 
     def __init__(self, main, filename):
 
-        if main:
-            self.setupPath(filename, create=True)
-
-            self.main = main
-            self.peers = {}   # {ipp -> time}
-
-            self.loadState()
-
-            self.saveState_dcall = None
-            self.saveState()
-
-        else:
-            # Only read the UDP port (for --terminate)
-            try:
-                self.setupPath(filename, create=False)
-                d = self.readDict()
-                self.udp_port, = struct.unpack('!H', d['udp_port'])
-            except:
-                self.udp_port = None
-
-
-    def setupPath(self, filename, create):
-
         path = os.path.expanduser("~/.dtella")
-        if create and not os.path.exists(path):
-            os.mkdir(path)
+        if path[:1] == '~':
+            # Can't get a user directory, just save to cwd.
+            self.filename = filename
+        else:
+            try:
+                if not os.path.exists(path):
+                    os.mkdir(path)
+            except OSError:
+                twisted.python.log.err()
 
-        self.filename = "%s/%s" % (path, filename)
+            self.filename = "%s/%s" % (path, filename)
+
+        self.main = main
+        self.peers = {}   # {ipp -> time}
+
+        self.loadState()
+
+        self.saveState_dcall = None
+        self.saveState()
 
 
     def loadState(self):
@@ -97,6 +90,13 @@ class StateManager(object):
         except (KeyError, struct.error):
             self.persistent = False
 
+
+        # Get LocalSearch flag
+        try:
+            self.localsearch = bool(*struct.unpack('!B', d['localsearch']))
+        except (KeyError, struct.error):
+            self.localsearch = True
+            
         # Get IP cache
         try:
             ipcache = d['ipcache']
@@ -165,14 +165,19 @@ class StateManager(object):
 
             d['persistent'] = struct.pack('!B', self.persistent)
 
+            d['localsearch'] = struct.pack('!B', self.localsearch)
+
             peerdata = [struct.pack('!6sI', ipp, int(when))
                         for when, ipp in self.getYoungestPeers(128)]
             
             d['ipcache'] = ''.join(peerdata)
 
             d['suffix'] = self.suffix
-            
-            self.writeDict(d)
+
+            try:
+                self.writeDict(d)
+            except:
+                twisted.python.log.err()
 
         dcall_discard(self, 'saveState_dcall')
 
