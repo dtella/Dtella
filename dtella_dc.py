@@ -694,6 +694,11 @@ class DCHandler(BaseDCProtocol):
             self.pushStatus("*** You must be online to chat!")
             return
 
+        if self.main.osm.isModerated():
+            self.pushStatus(
+                "*** Can't send text; the chat is currently moderated.")
+            return
+
         text = text.replace('\r\n','\n').replace('\r','\n')
 
         for line in text.split('\n'):
@@ -801,6 +806,12 @@ class DCHandler(BaseDCProtocol):
         assert self.isOnline()
 
         osm = self.main.osm
+
+        if osm.isModerated():
+            # If the channel went moderated with something in the queue,
+            # wipe it out and don't send.
+            del self.chatq[:]
+            return
 
         packet = osm.mrm.broadcastHeader('CH', osm.me.ipp)
         packet.append(struct.pack('!I', osm.mrm.getPacketNumber_chat()))
@@ -1269,7 +1280,7 @@ class DtellaBot(object):
         if len(args) == 0:
             out("Rebooting Node...")
             self.main.shutdown(reconnect='no')
-            self.main.newConnectionRequest()
+            self.main.startConnecting()
             return
 
         self.syntaxHelp(out, 'REBOOT', prefix)
@@ -1308,7 +1319,7 @@ class DtellaBot(object):
                     out("Added to peer cache: %s" % ad.getTextIPPort())
 
                     # Jump-start stuff if it's not already going
-                    self.main.newConnectionRequest()
+                    self.main.startConnecting()
                 else:
                     out("The address '%s' is not permitted on this network."
                         % ad.getTextIPPort())
@@ -1337,7 +1348,7 @@ class DtellaBot(object):
                 if self.main.osm:
                     self.main.osm.updateMyInfo()
 
-                self.main.newConnectionRequest()
+                self.main.startConnecting()
                 return
 
             elif args[0] == 'OFF':
@@ -1391,7 +1402,7 @@ class DtellaBot(object):
         self.syntaxHelp(out, 'REJOIN', prefix)
 
 
-    def handleCmd_USERS(self, out, args, preifx):
+    def handleCmd_USERS(self, out, args, prefix):
 
         if not self.dch.isOnline():
             out("You must be online to use %sUSERS." % prefix)
@@ -1406,7 +1417,7 @@ class DtellaBot(object):
             )
 
 
-    def handleCmd_SHARED(self, out, args, preifx):
+    def handleCmd_SHARED(self, out, args, prefix):
 
         if not self.dch.isOnline():
             out("You must be online to use %sSHARED." % prefix)
@@ -1597,7 +1608,7 @@ class DtellaBot(object):
         if self.main.dnsh.overrideVersion():
             out("Overriding minimum version!  Don't be surprised "
                 "if something breaks.")
-            self.main.newConnectionRequest()
+            self.main.startConnecting()
         else:
             out("%sVERSION_OVERRIDE not needed." % prefix)
 
