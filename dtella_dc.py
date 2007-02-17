@@ -33,6 +33,7 @@ import dtella_local
 import struct
 import re
 import binascii
+import socket
 
 # Login Procedure
 # H>C $HubName
@@ -51,7 +52,10 @@ class BaseDCProtocol(LineOnlyReceiver):
 
 
     def connectionMade(self):
-        self.transport.setTcpNoDelay(True)
+        try:
+            self.transport.setTcpNoDelay(True)
+        except socket.error:
+            pass
         self.dispatch = {}
 
 
@@ -243,8 +247,10 @@ class DCHandler(BaseDCProtocol):
         self.chat_counter = 99999
         self.chatRate_dcall = None
 
-        # ['login_N', 'login_G', 'login_I', 'queued', 'ready', 'invisible']
-        self.state = 'login_N'
+        # ['login_1', 'login_2', 'queued', 'ready', 'invisible']
+        self.state = 'login_1'
+
+        self.loginblockers = set(('MyINFO', 'GetNickList'))
 
         self.queued_dcall = None
         self.autoRejoin_dcall = None
@@ -291,7 +297,7 @@ class DCHandler(BaseDCProtocol):
         
         dcall_discard(self, 'init_dcall')
         
-        if self.state != 'login_N':
+        if self.state != 'login_1':
             self.fatalError("$MyNick not expected.")
             return
 
@@ -308,12 +314,12 @@ class DCHandler(BaseDCProtocol):
 
         dcall_discard(self, 'init_dcall')
 
-        if self.state != 'login_N':
+        if self.state != 'login_1':
             self.fatalError("$ValidateNick not expected.")
             return
 
-        # Next, we expect $GetNickList
-        self.state = 'login_G'
+        # Next, we expect $GetNickList+$MyINFO
+        self.state = 'login_2'
 
         reason = validateNick(nick)
 
@@ -349,13 +355,9 @@ class DCHandler(BaseDCProtocol):
 
     def d_GetNickList(self):
 
-        if self.state == 'login_N':
+        if self.state == 'login_1':
             self.fatalError("Got $GetNickList, expected $ValidateNick")
             return
-
-        # Next, we expect $MyINFO
-        if self.state == 'login_G':
-            self.state = 'login_I'
 
         # Me and the bot are ALWAYS online
         nicks = [self.bot.nick, self.nick]
@@ -371,30 +373,38 @@ class DCHandler(BaseDCProtocol):
         self.sendLine("$NickList %s$$" % '$$'.join(nicks))
         self.sendLine("$OpList %s$$" % self.bot.nick)
 
+        if self.state == 'login_2':
+            self.removeLoginBlocker('GetNickList')
+
 
     def d_MyInfo(self, _1, _2, info):
 
-        if self.state == 'login_N':
+        if self.state == 'login_1':
             self.fatalError("Got $MyINFO, expected $ValidateNick")
-            return
-
-        elif self.state == 'login_G':
-            self.fatalError("Got $MyINFO, expected $GetNickList")
             return
 
         # Save my new info
         self.info = info.replace('\r','').replace('\n','')
 
-        if self.state == 'login_I':
-            self.loginComplete()
+        if self.state == 'login_2':
+            self.removeLoginBlocker('MyINFO')
 
         elif self.isOnline():
             self.main.osm.updateMyInfo()
 
 
-    def loginComplete(self):
+    def removeLoginBlocker(self, blocker):
 
-        assert self.state == 'login_I'
+        assert self.state == 'login_2'
+
+        try:
+            self.loginblockers.remove(blocker)
+            if self.loginblockers:
+                return
+        except KeyError:
+            return
+
+        # None left, continue connecting...
 
         if self.main.dch is None:
             self.attachMeToDtella()
@@ -694,6 +704,11 @@ class DCHandler(BaseDCProtocol):
             self.pushStatus("*** You must be online to chat!")
             return
 
+        if self.main.osm.isModerated():
+            self.pushStatus(
+                "*** Can't send text; the chat is currently moderated.")
+            return
+
         text = text.replace('\r\n','\n').replace('\r','\n')
 
         for line in text.split('\n'):
@@ -801,6 +816,12 @@ class DCHandler(BaseDCProtocol):
         assert self.isOnline()
 
         osm = self.main.osm
+
+        if osm.isModerated():
+            # If the channel went moderated with something in the queue,
+            # wipe it out and don't send.
+            del self.chatq[:]
+            return
 
         packet = osm.mrm.broadcastHeader('CH', osm.me.ipp)
         packet.append(struct.pack('!I', osm.mrm.getPacketNumber_chat()))
@@ -1269,7 +1290,7 @@ class DtellaBot(object):
         if len(args) == 0:
             out("Rebooting Node...")
             self.main.shutdown(reconnect='no')
-            self.main.newConnectionRequest()
+            self.main.startConnecting()
             return
 
         self.syntaxHelp(out, 'REBOOT', prefix)
@@ -1308,7 +1329,7 @@ class DtellaBot(object):
                     out("Added to peer cache: %s" % ad.getTextIPPort())
 
                     # Jump-start stuff if it's not already going
-                    self.main.newConnectionRequest()
+                    self.main.startConnecting()
                 else:
                     out("The address '%s' is not permitted on this network."
                         % ad.getTextIPPort())
@@ -1337,7 +1358,7 @@ class DtellaBot(object):
                 if self.main.osm:
                     self.main.osm.updateMyInfo()
 
-                self.main.newConnectionRequest()
+                self.main.startConnecting()
                 return
 
             elif args[0] == 'OFF':
@@ -1391,7 +1412,7 @@ class DtellaBot(object):
         self.syntaxHelp(out, 'REJOIN', prefix)
 
 
-    def handleCmd_USERS(self, out, args, preifx):
+    def handleCmd_USERS(self, out, args, prefix):
 
         if not self.dch.isOnline():
             out("You must be online to use %sUSERS." % prefix)
@@ -1406,7 +1427,7 @@ class DtellaBot(object):
             )
 
 
-    def handleCmd_SHARED(self, out, args, preifx):
+    def handleCmd_SHARED(self, out, args, prefix):
 
         if not self.dch.isOnline():
             out("You must be online to use %sSHARED." % prefix)
@@ -1597,7 +1618,7 @@ class DtellaBot(object):
         if self.main.dnsh.overrideVersion():
             out("Overriding minimum version!  Don't be surprised "
                 "if something breaks.")
-            self.main.newConnectionRequest()
+            self.main.startConnecting()
         else:
             out("%sVERSION_OVERRIDE not needed." % prefix)
 

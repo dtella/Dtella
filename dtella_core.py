@@ -41,7 +41,7 @@ from dtella_util import (RandSet, Ad, dcall_discard, dcall_timeleft, randbytes,
                          get_version_string, parse_dtella_tag)
 
 
-# TODO: convert "TKL + G" and "TKL + Z" into net bans
+# TODO: Better formatting of mode changes
 
 
 # Miscellaneous Exceptions
@@ -106,6 +106,9 @@ CHANGE_BIT = 0x1
 
 # Bridge Kick flags
 REJOIN_BIT = 0x1
+
+# Bridge general flags
+MODERATED_BIT = 0x1
 
 # Init response codes
 CODE_IP_OK = 0
@@ -279,11 +282,6 @@ class PeerHandler(DatagramProtocol):
                 dch.pushSearchResult(rawdata)
             return
 
-        # TODO: this is deprecated
-        elif rawdata == "DTELLA_KILL" and ad.ip == (127,0,0,1):
-            reactor.stop()
-            return
-        
         try:
             try:
                 data = self.main.pk_enc.decrypt(rawdata)
@@ -463,7 +461,7 @@ class PeerHandler(DatagramProtocol):
             self.main.logPacket("Bad Broadcast: %s" % str(e))
             
             # Mark that we've seen this message, but don't forward it.
-            osm.mrm.newMessage(data, nb_ipp, tries=0)
+            osm.mrm.newMessage(data, tries=0, nb_ipp=nb_ipp)
 
             # Ack and skip the rest
             self.sendAckPacket(nb_ipp, ACK_BROADCAST, ack_flags, ack_key)
@@ -494,7 +492,7 @@ class PeerHandler(DatagramProtocol):
         
             # Pass this message to MessageRoutingManager, so it will be
             # forwarded to all of my neighbors.
-            osm.mrm.newMessage(''.join(packet), nb_ipp)
+            osm.mrm.newMessage(''.join(packet), tries=2, nb_ipp=nb_ipp)
 
         # Ack the neighbor
         self.sendAckPacket(nb_ipp, ACK_BROADCAST, ack_flags, ack_key)
@@ -670,13 +668,14 @@ class PeerHandler(DatagramProtocol):
             except ValueError:
                 pass
 
-        elif self.main.reconnect_dcall and my_ad.auth_s():
+        elif (self.main.reconnect_dcall and self.main.accept_IQ_trigger
+              and my_ad.auth_s()):
             # If we've recently failed to connect, then go online
             # as the sole node on the network.  Then report our node ipp
             # so this other node can try to join us.
 
             self.main.addMyIPReport(src_ad, my_ad)
-            self.main.startNodeSync()
+            self.main.startNodeSync(())
 
             osm = self.main.osm
             node_ipps = [osm.me.ipp]
@@ -1043,6 +1042,12 @@ class PeerHandler(DatagramProtocol):
 
             if src_n and src_n.bridge_data:
                 raise BadBroadcast("Bridge can't chat")
+
+            if osm.isModerated():
+                # Note: this may desync the sender's chat_pktnum, causing
+                # their next valid message to be delayed by 2 seconds, but
+                # it's better than broadcasting useless traffic.
+                raise BadBroadcast("Chat is moderated")
 
             elif src_n and src_n.expire_dcall and nhash == src_n.nickHash():
                 osm.cms.addMessage(
@@ -2599,6 +2604,17 @@ class OnlineStateManager(object):
         self.statusLimit_dcall = reactor.callLater(0, cb)
 
 
+    def isModerated(self):
+
+        if self.bcm:
+            return self.bcm.isModerated()
+
+        if self.bsm:
+            return self.bsm.isModerated()
+
+        return False
+
+
     def sendLoginEcho(self):
         # Send a packet to myself, in order to determine how my router
         # (if any) reacts to loopback'd packets.
@@ -2974,7 +2990,7 @@ class PingManager(object):
             packet.append(pkt_id)
             packet.append(n.sesid)
 
-            osm.mrm.newMessage(''.join(packet))
+            osm.mrm.newMessage(''.join(packet), tries=2)
 
             osm.scheduleNodeExpire(n, NODE_EXPIRE_EXTEND)
 
@@ -3240,17 +3256,14 @@ class MessageRoutingManager(object):
 
 
         def sendToNeighbor(self, nb_ipp, ph):
-            # If we don't need to transmit this message, 
-            
+            # Pass this current message to the given neighbor
+           
             if nb_ipp in self.nbs:
                 # This neighbor has already seen our message
                 return
 
             def cb(data, tries):
                 # Ack timeout callback
-
-                # The number of tries may be reduced externally
-                tries = min(tries, self.tries)
 
                 # Make an attempt now
                 if tries > 0:
@@ -3265,7 +3278,15 @@ class MessageRoutingManager(object):
                 else:
                     self.nbs[nb_ipp] = None
 
-            cb(self.data, self.tries)
+            data = self.data
+            tries = self.tries
+
+            # If we're passing an NF to the node who's dying, then up the
+            # number of retries to 8, because it's rather important.
+            if data[0:2] == 'NF' and data[10:16] == nb_ipp:
+                tries = 8
+
+            cb(data, tries)
 
 
         def shutdown(self):
@@ -3357,7 +3378,7 @@ class MessageRoutingManager(object):
         return True
 
 
-    def newMessage(self, data, nb_ipp=None, tries=2):
+    def newMessage(self, data, tries, nb_ipp=None):
         # Forward a new message to my neighbors
 
         ack_key = self.generateKey(data)
@@ -3785,11 +3806,12 @@ class BanManager(object):
                             osm.pgm.instaKillNeighbor(n)
 
                 # Check myself
-                ip, = struct.unpack('!i', osm.me.ipp[:4])
-                if self.matchBan(ban_ip, ban_mask, ip):
-                    self.main.showLoginStatus("You were banned.")
-                    self.main.shutdown(reconnect='max')
-                    break
+                if not osm.bsm:
+                    ip, = struct.unpack('!i', osm.me.ipp[:4])
+                    if self.matchBan(ban_ip, ban_mask, ip):
+                        self.main.showLoginStatus("You were banned.")
+                        self.main.shutdown(reconnect='max')
+                        break
 
             self.newbans.clear()
 
@@ -3826,8 +3848,8 @@ class BanManager(object):
                     if self.matchBan(ban_ip, ban_mask, ip):
                         return True
 
-        elif osm.bsm:
-            for ban_ip, ban_mask in osm.bsm.bans:
+        elif osm.bsm and self.main.ircs:
+            for ban_ip, ban_mask in self.main.ircs.data.bans:
                 if self.matchBan(ban_ip, ban_mask, ip):
                     return True
 
@@ -3970,6 +3992,8 @@ class DtellaMain_Base(object):
         # Neighbor Connection Manager
         self.osm = None
 
+        self.accept_IQ_trigger = False
+
         # Pakcet Encoder
         self.pk_enc = dtella_crypto.PacketEncoder(dtella_local.network_key)
 
@@ -3982,19 +4006,20 @@ class DtellaMain_Base(object):
         raise NotImplemented("Override me!")
 
 
-    def connectionPermitted(self):
+    def reconnectDesired(self):
         raise NotImplemented("Override me!")
 
 
     def startConnecting(self):
+        raise NotImplemented("Override me!")
+
+
+    def startInitialContact(self):
         # If all the conditions are right, start connection procedure
 
         assert not (self.icm or self.osm)
 
         dcall_discard(self, 'reconnect_dcall')
-
-        if not self.connectionPermitted():
-            return
 
         def cb():
             icm = self.icm
@@ -4002,52 +4027,56 @@ class DtellaMain_Base(object):
             
             if icm.node_ipps:
                 self.startNodeSync(icm.node_ipps)
+                return
+
+            reason = icm.getFailReason()
+
+            if reason == 'banned_ip':
+                self.showLoginStatus(
+                    "Your IP seems to be banned from this network.")
+                self.shutdown(reconnect='max')
+
+            elif reason == 'foreign_ip':
+                self.showLoginStatus(
+                    "Your IP address is not authorized to use this network.")
+                self.shutdown(reconnect='max')
+
+            elif reason == 'dead_port':
+                self.showLoginStatus(
+                    "*** UDP PORT FORWARD REQUIRED ***")
+
+                text = (
+                    "In order for Dtella to communicate properly, it "
+                    "needs to receive UDP traffic from the Internet.  "
+                    "Dtella is currently listening on UDP port %d, but "
+                    "the packets appear to be getting blocked, most "
+                    "likely by a firewall or a router.  If this is the "
+                    "case, then you will have to configure your firewall "
+                    "or router to allow UDP traffic through on this "
+                    "port.  You may tell Dtella to use a different port "
+                    "from now on by typing !UDP followed by a number."
+                    % self.state.udp_port
+                    )
+                
+                for line in word_wrap(text):
+                    self.showLoginStatus(line)
+
+                self.shutdown(reconnect='max')
+
             else:
-                reason = icm.getFailReason()
+                self.showLoginStatus(
+                    "No online nodes found.")
+                self.shutdown(reconnect='normal')
 
-                if reason == 'banned_ip':
-                    self.showLoginStatus(
-                        "You seem to be banned.")
-                    self.shutdown(reconnect='max')
-
-                elif reason == 'foreign_ip':
-                    self.showLoginStatus(
-                        "Your IP address is not authorized to use "
-                        "this network.")
-                    self.shutdown(reconnect='max')
-
-                elif reason == 'dead_port':
-                    self.showLoginStatus(
-                        "*** UDP PORT FORWARD REQUIRED ***")
-
-                    text = (
-                        "In order for Dtella to communicate properly, it "
-                        "needs to receive UDP traffic from the Internet.  "
-                        "Dtella is currently listening on UDP port %d, but "
-                        "the packets appear to be getting blocked, most "
-                        "likely by a firewall or a router.  If this is the "
-                        "case, then you will have to configure your firewall "
-                        "or router to allow UDP traffic through on this "
-                        "port.  You may tell Dtella to use a different port "
-                        "from now on by typing !UDP followed by a number."
-                        % self.state.udp_port
-                        )
-                    
-                    for line in word_wrap(text):
-                        self.showLoginStatus(line)
-
-                    self.shutdown(reconnect='max')
-
-                else:
-                    self.showLoginStatus(
-                        "No online nodes found.")
-                    self.shutdown(reconnect='normal')
+                # If we receive an IQ packet after finding no nodes, then
+                # assume we're a root node and form an empty network
+                self.accept_IQ_trigger = True
 
         self.ph.remap_ip = None
         self.icm = InitialContactManager(self, cb)
 
 
-    def startNodeSync(self, node_ipps=()):
+    def startNodeSync(self, node_ipps):
         # Determine my IP address and enable the osm
 
         assert not (self.icm or self.osm)
@@ -4099,6 +4128,7 @@ class DtellaMain_Base(object):
             self.showLoginStatus("Shutting down.")
 
         dcall_discard(self, 'reconnect_dcall')
+        self.accept_IQ_trigger = False
 
         # Shut down InitialContactManager
         if self.icm:
@@ -4116,7 +4146,7 @@ class DtellaMain_Base(object):
         # Schedule a Reconnect (maybe) ...
 
         # Check if a reconnect makes sense right now
-        if not self.connectionPermitted():
+        if not self.reconnectDesired():
             return
 
         if reconnect == 'no':
