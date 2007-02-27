@@ -1,4 +1,4 @@
-set DTDIR="dtella-purdue-SVN"
+set DTDIR="dtella-purdue-1.0.3"
 set ARC="C:\Program Files\7-Zip\7z.exe"
 set NSIS="C:\Program Files\NSIS\makensisw.exe"
 set OUTDIR="Output"
@@ -18,7 +18,7 @@ copy ..\dtella_core.py           %DTDIR%
 copy ..\dtella_crypto.py         %DTDIR%
 copy ..\dtella_dc.py             %DTDIR%
 copy ..\dtella_dnslookup.py      %DTDIR%
-copy ..\dtella_fixtwistedtime.py %DTDIR%
+copy ..\dtella_fixtwisted.py     %DTDIR%
 copy ..\dtella_local.py          %DTDIR%
 copy ..\dtella_state.py          %DTDIR%
 copy ..\dtella_util.py           %DTDIR%
